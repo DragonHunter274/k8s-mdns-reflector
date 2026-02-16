@@ -1,0 +1,31 @@
+name: Build and Publish
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: ko-build/setup-ko@v0.8
+
+      - name: Build image
+        if: github.event_name == 'pull_request'
+        run: ko build --sbom=spdx .
+
+      - name: Publish image
+        if: github.event_name == 'push'
+        run: ko build --sbom=spdx -t latest .

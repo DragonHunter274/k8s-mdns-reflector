@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mdns-reflector
+  namespace: mdns-reflector
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mdns-reflector
+  namespace: mdns-reflector
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mdns-reflector
+  namespace: mdns-reflector
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: mdns-reflector
+subjects:
+  - kind: ServiceAccount
+    name: mdns-reflector
+    namespace: mdns-reflector
