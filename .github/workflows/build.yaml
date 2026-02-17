@@ -24,8 +24,8 @@ jobs:
 
       - name: Build image
         if: github.event_name == 'pull_request'
-        run: ko build --sbom=spdx .
+        run: ko build --bare --sbom=spdx .
 
       - name: Publish image
         if: github.event_name == 'push'
-        run: ko build --sbom=spdx -t latest .
+        run: ko build --bare --sbom=spdx -t latest .

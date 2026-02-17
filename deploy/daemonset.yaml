@@ -21,7 +21,7 @@ spec:
         - operator: Exists
       containers:
         - name: mdns-reflector
-          image: ghcr.io/dragonhunter274/mdns-reflector:latest # pin to @sha256:... after first push
+          image: ghcr.io/dragonhunter274/k8s-mdns-reflector:latest # pin to @sha256:... after first push
           env:
             - name: NODE_NAME
               valueFrom:
