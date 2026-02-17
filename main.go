@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -234,10 +235,45 @@ func handleClusterService(entry *zeroconf.ServiceEntry) {
 	svc.Origin = nodeName
 	svc.Source = "cluster"
 
-	// Rewrite pod IP -> NodeIP
-	svc.IPs = []string{nodeIP}
+	// Use the MetalLB LoadBalancer IP if a matching Service exists; fall back to node IP.
+	if ip := lookupLoadBalancerIP(entry); ip != "" {
+		svc.IPs = []string{ip}
+	} else {
+		svc.IPs = []string{nodeIP}
+	}
 
 	storeService(svc)
+}
+
+func lookupLoadBalancerIP(entry *zeroconf.ServiceEntry) string {
+	svcs, err := clientset.CoreV1().Services("").List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		log.Println("Failed to list services:", err)
+		return ""
+	}
+
+	for _, svc := range svcs.Items {
+		if svc.Spec.Type != v1.ServiceTypeLoadBalancer {
+			continue
+		}
+		if len(svc.Status.LoadBalancer.Ingress) == 0 {
+			continue
+		}
+		ip := svc.Status.LoadBalancer.Ingress[0].IP
+		if ip == "" {
+			continue
+		}
+		if !strings.EqualFold(svc.Name, entry.Instance) {
+			continue
+		}
+		for _, port := range svc.Spec.Ports {
+			if int(port.Port) == entry.Port {
+				return ip
+			}
+		}
+	}
+
+	return ""
 }
 
 //
