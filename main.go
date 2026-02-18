@@ -176,10 +176,6 @@ func handleConfigMap(obj interface{}) {
 			continue
 		}
 
-		if svc.Origin == nodeName {
-			continue
-		}
-
 		ensureAdvertised(svc)
 	}
 }
