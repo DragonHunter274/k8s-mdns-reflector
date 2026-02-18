@@ -56,6 +56,17 @@ var (
 	activeBrowsers = map[string]struct{}{}
 	browsersMutex  sync.Mutex
 
+	// pendingServices buffers service writes; flushed in a single ConfigMap
+	// update by runConfigMapWriter to avoid per-service API calls.
+	pendingServices = map[string]string{}
+	pendingMutex    sync.Mutex
+	pendingDirty    bool
+
+	// k8sServicesCache is a cached list of LoadBalancer services, refreshed
+	// periodically to avoid listing on every mDNS event.
+	k8sServicesCache     []v1.Service
+	k8sServicesCacheMu   sync.RWMutex
+
 	clientset *kubernetes.Clientset
 )
 
@@ -92,6 +103,8 @@ func main() {
 	go browseCluster(ctx)
 	go browseLAN(ctx)
 	go runConfigMapInformer(ctx)
+	go runConfigMapWriter(ctx)
+	go runServiceCacheRefresh(ctx)
 
 	waitForShutdown(cancel)
 }
@@ -285,14 +298,40 @@ func handleClusterService(entry *zeroconf.ServiceEntry) {
 	storeService(svc)
 }
 
-func lookupLoadBalancerIP(entry *zeroconf.ServiceEntry) string {
-	svcs, err := clientset.CoreV1().Services("").List(context.TODO(), metav1.ListOptions{})
-	if err != nil {
-		log.Println("Failed to list services:", err)
-		return ""
+// runServiceCacheRefresh refreshes the cached list of LoadBalancer services
+// every 30 seconds so lookupLoadBalancerIP never hits the API per-event.
+func runServiceCacheRefresh(ctx context.Context) {
+	refresh := func() {
+		svcs, err := clientset.CoreV1().Services("").List(context.TODO(), metav1.ListOptions{})
+		if err != nil {
+			log.Println("Failed to refresh services cache:", err)
+			return
+		}
+		k8sServicesCacheMu.Lock()
+		k8sServicesCache = svcs.Items
+		k8sServicesCacheMu.Unlock()
 	}
 
-	for _, svc := range svcs.Items {
+	refresh() // populate immediately on startup
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			refresh()
+		}
+	}
+}
+
+func lookupLoadBalancerIP(entry *zeroconf.ServiceEntry) string {
+	k8sServicesCacheMu.RLock()
+	svcs := k8sServicesCache
+	k8sServicesCacheMu.RUnlock()
+
+	for _, svc := range svcs {
 		if svc.Spec.Type != v1.ServiceTypeLoadBalancer {
 			continue
 		}
@@ -322,22 +361,58 @@ func lookupLoadBalancerIP(entry *zeroconf.ServiceEntry) string {
 // =====================================================
 //
 
+// storeService buffers the service entry in memory. The actual ConfigMap write
+// is batched by runConfigMapWriter to avoid per-discovery API calls.
 func storeService(svc ServiceEntry) {
 	data, _ := json.Marshal(svc)
 	key := svc.Instance + "-" + svc.Service
+
+	pendingMutex.Lock()
+	pendingServices[key] = string(data)
+	pendingDirty = true
+	pendingMutex.Unlock()
+}
+
+// runConfigMapWriter flushes all pending service entries to the ConfigMap in a
+// single API call every 2 seconds, keeping API traffic minimal.
+func runConfigMapWriter(ctx context.Context) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			flushPendingServices()
+		}
+	}
+}
+
+func flushPendingServices() {
+	pendingMutex.Lock()
+	if !pendingDirty {
+		pendingMutex.Unlock()
+		return
+	}
+	snapshot := make(map[string]string, len(pendingServices))
+	for k, v := range pendingServices {
+		snapshot[k] = v
+	}
+	pendingDirty = false
+	pendingMutex.Unlock()
 
 	for {
 		cm, err := clientset.CoreV1().ConfigMaps(namespace).
 			Get(context.TODO(), configMapName, metav1.GetOptions{})
 
 		if err != nil {
-			// ConfigMap doesn't exist yet — create it.
 			newCM := &v1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      configMapName,
 					Namespace: namespace,
 				},
-				Data: map[string]string{key: string(data)},
+				Data: snapshot,
 			}
 			_, err = clientset.CoreV1().ConfigMaps(namespace).
 				Create(context.TODO(), newCM, metav1.CreateOptions{})
@@ -345,7 +420,9 @@ func storeService(svc ServiceEntry) {
 			if cm.Data == nil {
 				cm.Data = map[string]string{}
 			}
-			cm.Data[key] = string(data)
+			for k, v := range snapshot {
+				cm.Data[k] = v
+			}
 			_, err = clientset.CoreV1().ConfigMaps(namespace).
 				Update(context.TODO(), cm, metav1.UpdateOptions{})
 		}
