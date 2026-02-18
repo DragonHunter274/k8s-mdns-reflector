@@ -170,14 +170,25 @@ func handleConfigMap(obj interface{}) {
 		return
 	}
 
+	activeKeys := map[string]struct{}{}
 	for _, raw := range cm.Data {
 		var svc ServiceEntry
 		if err := json.Unmarshal([]byte(raw), &svc); err != nil {
 			continue
 		}
-
+		activeKeys[svc.Instance+svc.Service] = struct{}{}
 		ensureAdvertised(svc)
 	}
+
+	// Shut down advertisements for services no longer in the ConfigMap.
+	localMutex.Lock()
+	for k, s := range localAds {
+		if _, exists := activeKeys[k]; !exists {
+			s.Shutdown()
+			delete(localAds, k)
+		}
+	}
+	localMutex.Unlock()
 }
 
 func handleConfigMapDelete(obj interface{}) {
@@ -385,7 +396,27 @@ func runConfigMapWriter(ctx context.Context) {
 	}
 }
 
+// pruneStaleServices removes entries from pendingServices that haven't been
+// re-announced within the TTL, indicating the service has gone away.
+func pruneStaleServices() {
+	const ttl = 3 * time.Minute
+	cutoff := time.Now().Add(-ttl).Unix()
+
+	pendingMutex.Lock()
+	defer pendingMutex.Unlock()
+
+	for k, raw := range pendingServices {
+		var svc ServiceEntry
+		if err := json.Unmarshal([]byte(raw), &svc); err != nil || svc.Timestamp < cutoff {
+			delete(pendingServices, k)
+			pendingDirty = true
+		}
+	}
+}
+
 func flushPendingServices() {
+	pruneStaleServices()
+
 	pendingMutex.Lock()
 	if !pendingDirty {
 		pendingMutex.Unlock()
@@ -415,6 +446,13 @@ func flushPendingServices() {
 		} else {
 			if cm.Data == nil {
 				cm.Data = map[string]string{}
+			}
+			// Replace this node's entries wholesale so removals propagate.
+			for k, raw := range cm.Data {
+				var svc ServiceEntry
+				if json.Unmarshal([]byte(raw), &svc) == nil && svc.Origin == nodeName {
+					delete(cm.Data, k)
+				}
 			}
 			for k, v := range snapshot {
 				cm.Data[k] = v
