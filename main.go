@@ -51,6 +51,11 @@ var (
 	localAds   = map[string]*zeroconf.Server{}
 	localMutex sync.Mutex
 
+	// activeBrowsers tracks service types already being browsed per interface
+	// to avoid spawning duplicate sub-browsers.
+	activeBrowsers = map[string]struct{}{}
+	browsersMutex  sync.Mutex
+
 	clientset *kubernetes.Clientset
 )
 
@@ -185,33 +190,64 @@ func handleConfigMapDelete(obj interface{}) {
 func browseLAN(ctx context.Context) {
 	resolver, err := zeroconf.NewResolver(zeroconf.SelectIfaces([]net.Interface{lanIface}))
 	if err != nil {
-		log.Fatal("Failed to create LAN resolver:", err)
+		log.Fatal("Failed to create LAN type resolver:", err)
 	}
-	entries := make(chan *zeroconf.ServiceEntry)
+	types := make(chan *zeroconf.ServiceEntry)
 
 	go func() {
-		for entry := range entries {
-			handleLANService(entry)
+		for entry := range types {
+			startInstanceBrowser(ctx, entry.Instance, lanIface, handleLANService)
 		}
 	}()
 
-	resolver.Browse(ctx, "_services._dns-sd._udp", "local.", entries)
+	resolver.Browse(ctx, "_services._dns-sd._udp", "local.", types)
 }
 
 func browseCluster(ctx context.Context) {
 	resolver, err := zeroconf.NewResolver(zeroconf.SelectIfaces([]net.Interface{clusterIface}))
 	if err != nil {
-		log.Fatal("Failed to create cluster resolver:", err)
+		log.Fatal("Failed to create cluster type resolver:", err)
 	}
-	entries := make(chan *zeroconf.ServiceEntry)
+	types := make(chan *zeroconf.ServiceEntry)
 
 	go func() {
-		for entry := range entries {
-			handleClusterService(entry)
+		for entry := range types {
+			startInstanceBrowser(ctx, entry.Instance, clusterIface, handleClusterService)
 		}
 	}()
 
-	resolver.Browse(ctx, "_services._dns-sd._udp", "local.", entries)
+	resolver.Browse(ctx, "_services._dns-sd._udp", "local.", types)
+}
+
+// startInstanceBrowser starts a Browse for actual service instances of a given
+// service type on the specified interface. Deduplicates by (iface, serviceType).
+func startInstanceBrowser(ctx context.Context, serviceType string, iface net.Interface, handler func(*zeroconf.ServiceEntry)) {
+	key := iface.Name + "/" + serviceType
+
+	browsersMutex.Lock()
+	if _, exists := activeBrowsers[key]; exists {
+		browsersMutex.Unlock()
+		return
+	}
+	activeBrowsers[key] = struct{}{}
+	browsersMutex.Unlock()
+
+	log.Printf("Browsing %s on %s", serviceType, iface.Name)
+
+	go func() {
+		resolver, err := zeroconf.NewResolver(zeroconf.SelectIfaces([]net.Interface{iface}))
+		if err != nil {
+			log.Printf("Failed to create resolver for %s on %s: %v", serviceType, iface.Name, err)
+			return
+		}
+		entries := make(chan *zeroconf.ServiceEntry)
+		go func() {
+			for entry := range entries {
+				handler(entry)
+			}
+		}()
+		resolver.Browse(ctx, serviceType, "local.", entries)
+	}()
 }
 
 func handleLANService(entry *zeroconf.ServiceEntry) {
@@ -284,29 +320,31 @@ func lookupLoadBalancerIP(entry *zeroconf.ServiceEntry) string {
 
 func storeService(svc ServiceEntry) {
 	data, _ := json.Marshal(svc)
+	key := svc.Instance + "-" + svc.Service
 
 	for {
 		cm, err := clientset.CoreV1().ConfigMaps(namespace).
 			Get(context.TODO(), configMapName, metav1.GetOptions{})
 
 		if err != nil {
-			cm = &v1.ConfigMap{
+			// ConfigMap doesn't exist yet — create it.
+			newCM := &v1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
-					Name: configMapName,
+					Name:      configMapName,
+					Namespace: namespace,
 				},
-				Data: map[string]string{},
+				Data: map[string]string{key: string(data)},
 			}
+			_, err = clientset.CoreV1().ConfigMaps(namespace).
+				Create(context.TODO(), newCM, metav1.CreateOptions{})
+		} else {
+			if cm.Data == nil {
+				cm.Data = map[string]string{}
+			}
+			cm.Data[key] = string(data)
+			_, err = clientset.CoreV1().ConfigMaps(namespace).
+				Update(context.TODO(), cm, metav1.UpdateOptions{})
 		}
-
-		key := svc.Instance + "-" + svc.Service
-		if cm.Data == nil {
-			cm.Data = map[string]string{}
-		}
-
-		cm.Data[key] = string(data)
-
-		_, err = clientset.CoreV1().ConfigMaps(namespace).
-			Update(context.TODO(), cm, metav1.UpdateOptions{})
 
 		if err == nil {
 			return
