@@ -196,7 +196,10 @@ func browseLAN(ctx context.Context) {
 
 	go func() {
 		for entry := range types {
-			startInstanceBrowser(ctx, entry.Instance, lanIface, handleLANService)
+			// entry.Instance from _services._dns-sd._udp includes the domain
+			// (e.g. "_http._tcp.local") — strip it to get the bare service type.
+			serviceType := strings.TrimSuffix(entry.Instance, ".local")
+			startInstanceBrowser(ctx, serviceType, lanIface, handleLANService)
 		}
 	}()
 
@@ -212,7 +215,8 @@ func browseCluster(ctx context.Context) {
 
 	go func() {
 		for entry := range types {
-			startInstanceBrowser(ctx, entry.Instance, clusterIface, handleClusterService)
+			serviceType := strings.TrimSuffix(entry.Instance, ".local")
+			startInstanceBrowser(ctx, serviceType, clusterIface, handleClusterService)
 		}
 	}()
 
