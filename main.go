@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -394,7 +396,7 @@ func lookupLoadBalancerIP(entry *zeroconf.ServiceEntry) string {
 // is batched by runConfigMapWriter to avoid per-discovery API calls.
 func storeService(svc ServiceEntry) {
 	data, _ := json.Marshal(svc)
-	key := svc.Instance + "-" + svc.Service
+	key := configMapKey(svc.Instance, svc.Service)
 
 	log.Printf("Discovered %s (%s) source=%s ips=%v", svc.Instance, svc.Service, svc.Source, svc.IPs)
 
@@ -544,6 +546,14 @@ func ensureAdvertised(svc ServiceEntry) {
 // Helpers
 // =====================================================
 //
+
+// configMapKey produces a key safe for ConfigMap data from an arbitrary
+// instance+service string. mDNS names can contain spaces, @, #, brackets
+// etc. which are not valid ConfigMap key characters.
+func configMapKey(instance, service string) string {
+	h := sha256.Sum256([]byte(instance + "/" + service))
+	return hex.EncodeToString(h[:12]) // 24 hex chars, collision-safe enough
+}
 
 func convert(e *zeroconf.ServiceEntry) ServiceEntry {
 	ips := []string{}
