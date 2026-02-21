@@ -11,7 +11,6 @@ import (
 
 	"time"
 
-	"github.com/cenkalti/backoff"
 	"github.com/miekg/dns"
 )
 
@@ -190,8 +189,7 @@ func (c *client) mainloop(ctx context.Context, params *LookupParams) {
 	}
 
 	// Iterate through channels from listeners goroutines
-	var entries, sentEntries map[string]*ServiceEntry
-	sentEntries = make(map[string]*ServiceEntry)
+	var entries map[string]*ServiceEntry
 	for {
 		select {
 		case <-ctx.Done():
@@ -274,10 +272,6 @@ func (c *client) mainloop(ctx context.Context, params *LookupParams) {
 			for k, e := range entries {
 				if e.TTL == 0 {
 					delete(entries, k)
-					delete(sentEntries, k)
-					continue
-				}
-				if _, ok := sentEntries[k]; ok {
 					continue
 				}
 
@@ -290,12 +284,9 @@ func (c *client) mainloop(ctx context.Context, params *LookupParams) {
 						continue
 					}
 				}
-				// Submit entry to subscriber and cache it.
-				// This is also a point to possibly stop probing actively for a
-				// service entry.
+				// Always re-send entries so callers can refresh timestamps
+				// for TTL-based expiry of stale services.
 				params.Entries <- e
-				sentEntries[k] = e
-				params.disableProbing()
 			}
 			// reset entries
 			entries = make(map[string]*ServiceEntry)
@@ -393,38 +384,22 @@ func (c *client) recv(ctx context.Context, l interface{}, msgCh chan *dns.Msg) {
 // TODO: move error reporting to shutdown function as periodicQuery is called from
 // go routine context.
 func (c *client) periodicQuery(ctx context.Context, params *LookupParams) error {
-	if params.stopProbing == nil {
-		return nil
-	}
-
-	bo := backoff.NewExponentialBackOff()
-	bo.InitialInterval = 4 * time.Second
-	bo.MaxInterval = 60 * time.Second
-	bo.Reset()
+	// Query continuously so that callers can detect when services appear
+	// or disappear.  Never stop on our own — only on context cancellation.
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
 
 	for {
-		// Do periodic query.
 		if err := c.query(params); err != nil {
 			return err
 		}
-		// Backoff and cancel logic.
-		wait := bo.NextBackOff()
-		if wait == backoff.Stop {
-			return fmt.Errorf("periodicQuery: abort due to timeout")
-		}
 		select {
-		case <-time.After(wait):
-			// Wait for next iteration.
-		case <-params.stopProbing:
-			// Chan is closed (or happened in the past).
-			// Done here. Received a matching mDNS entry.
-			return nil
+		case <-ticker.C:
+			// Next round.
 		case <-ctx.Done():
 			return ctx.Err()
-
 		}
 	}
-
 }
 
 // Performs the actual query by service name (browse) or service instance name (lookup),
