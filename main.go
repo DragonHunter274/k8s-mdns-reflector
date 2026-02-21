@@ -478,11 +478,13 @@ func flushPendingServices() {
 			cm.Data[k] = v
 		}
 
+		log.Printf("Writing ConfigMap with %d entries", len(cm.Data))
 		_, err = clientset.CoreV1().ConfigMaps(namespace).
 			Update(context.TODO(), cm, metav1.UpdateOptions{})
 		if err == nil {
 			return
 		}
+		log.Println("Failed to update ConfigMap:", err)
 
 		time.Sleep(100 * time.Millisecond)
 	}
