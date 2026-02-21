@@ -396,6 +396,8 @@ func storeService(svc ServiceEntry) {
 	data, _ := json.Marshal(svc)
 	key := svc.Instance + "-" + svc.Service
 
+	log.Printf("Discovered %s (%s) source=%s ips=%v", svc.Instance, svc.Service, svc.Source, svc.IPs)
+
 	pendingMutex.Lock()
 	pendingServices[key] = string(data)
 	pendingDirty = true
@@ -450,6 +452,8 @@ func flushPendingServices() {
 	}
 	pendingDirty = false
 	pendingMutex.Unlock()
+
+	log.Printf("Flushing %d services to ConfigMap", len(snapshot))
 
 	for {
 		cm, err := clientset.CoreV1().ConfigMaps(namespace).
