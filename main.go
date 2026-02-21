@@ -66,10 +66,13 @@ var (
 
 	// k8sServicesCache is a cached list of LoadBalancer services, refreshed
 	// periodically to avoid listing on every mDNS event.
-	k8sServicesCache     []v1.Service
-	k8sServicesCacheMu   sync.RWMutex
+	k8sServicesCache   []v1.Service
+	k8sServicesCacheMu sync.RWMutex
 
 	clientset *kubernetes.Clientset
+	// ignoreIPsCache tracks Node IPs and LoadBalancer IPs to prevent proxy loops.
+	ignoreIPsCache   map[string]bool
+	ignoreIPsCacheMu sync.RWMutex
 )
 
 func main() {
@@ -299,7 +302,7 @@ func startInstanceBrowser(ctx context.Context, serviceType string, iface net.Int
 }
 
 func handleLANService(entry *zeroconf.ServiceEntry) {
-	if hasOrigin(entry.Text) {
+	if isProxiedIP(entry) {
 		return
 	}
 
@@ -311,7 +314,7 @@ func handleLANService(entry *zeroconf.ServiceEntry) {
 }
 
 func handleClusterService(entry *zeroconf.ServiceEntry) {
-	if hasOrigin(entry.Text) {
+	if isProxiedIP(entry) {
 		return
 	}
 
@@ -333,14 +336,51 @@ func handleClusterService(entry *zeroconf.ServiceEntry) {
 // every 30 seconds so lookupLoadBalancerIP never hits the API per-event.
 func runServiceCacheRefresh(ctx context.Context) {
 	refresh := func() {
+		// 1. Fetch Services (existing)
 		svcs, err := clientset.CoreV1().Services("").List(context.TODO(), metav1.ListOptions{})
 		if err != nil {
 			log.Println("Failed to refresh services cache:", err)
 			return
 		}
+
+		// 2. Fetch Nodes (NEW)
+		nodes, err := clientset.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
+		if err != nil {
+			log.Println("Failed to refresh nodes cache:", err)
+			return
+		}
+
+		newIgnoreIPs := make(map[string]bool)
+
+		// Add Node IPs to the ignore list
+		for _, node := range nodes.Items {
+			for _, addr := range node.Status.Addresses {
+				if addr.Type == v1.NodeInternalIP || addr.Type == v1.NodeExternalIP {
+					newIgnoreIPs[addr.Address] = true
+				}
+			}
+		}
+
+		// Add LoadBalancer IPs to the ignore list
+		for _, svc := range svcs.Items {
+			if svc.Spec.Type == v1.ServiceTypeLoadBalancer {
+				for _, ing := range svc.Status.LoadBalancer.Ingress {
+					if ing.IP != "" {
+						newIgnoreIPs[ing.IP] = true
+					}
+				}
+			}
+		}
+
+		// Commit Service updates
 		k8sServicesCacheMu.Lock()
 		k8sServicesCache = svcs.Items
 		k8sServicesCacheMu.Unlock()
+
+		// Commit IP Ignore list updates
+		ignoreIPsCacheMu.Lock()
+		ignoreIPsCache = newIgnoreIPs
+		ignoreIPsCacheMu.Unlock()
 	}
 
 	refresh() // populate immediately on startup
@@ -355,6 +395,18 @@ func runServiceCacheRefresh(ctx context.Context) {
 			refresh()
 		}
 	}
+}
+
+func isProxiedIP(entry *zeroconf.ServiceEntry) bool {
+	ignoreIPsCacheMu.RLock()
+	defer ignoreIPsCacheMu.RUnlock()
+
+	for _, ip := range entry.AddrIPv4 {
+		if ignoreIPsCache[ip.String()] {
+			return true
+		}
+	}
+	return false
 }
 
 func lookupLoadBalancerIP(entry *zeroconf.ServiceEntry) string {
@@ -527,9 +579,9 @@ func ensureAdvertised(svc ServiceEntry) {
 		svc.Service,
 		svc.Domain,
 		svc.Port,
-		"proxy.local.",
+		"proxy",
 		svc.IPs,
-		append(svc.TXT, "origin="+svc.Origin),
+		svc.TXT,
 		ifaces,
 	)
 
@@ -570,13 +622,4 @@ func convert(e *zeroconf.ServiceEntry) ServiceEntry {
 		TXT:       e.Text,
 		Timestamp: time.Now().Unix(),
 	}
-}
-
-func hasOrigin(txt []string) bool {
-	for _, t := range txt {
-		if len(t) > 7 && t[:7] == "origin=" {
-			return true
-		}
-	}
-	return false
 }
