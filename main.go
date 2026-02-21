@@ -97,6 +97,8 @@ func main() {
 		log.Fatal(err)
 	}
 
+	ensureConfigMap()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -121,6 +123,26 @@ func lookupInterface(name string) (net.Interface, error) {
 		return net.Interface{}, fmt.Errorf("interface %s does not support multicast", name)
 	}
 	return *iface, nil
+}
+
+func ensureConfigMap() {
+	_, err := clientset.CoreV1().ConfigMaps(namespace).
+		Get(context.TODO(), configMapName, metav1.GetOptions{})
+	if err == nil {
+		return
+	}
+	cm := &v1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      configMapName,
+			Namespace: namespace,
+		},
+		Data: map[string]string{},
+	}
+	if _, err := clientset.CoreV1().ConfigMaps(namespace).
+		Create(context.TODO(), cm, metav1.CreateOptions{}); err != nil {
+		log.Fatal("Failed to create ConfigMap:", err)
+	}
+	log.Println("Created ConfigMap", configMapName)
 }
 
 func waitForShutdown(cancel context.CancelFunc) {
@@ -432,35 +454,28 @@ func flushPendingServices() {
 	for {
 		cm, err := clientset.CoreV1().ConfigMaps(namespace).
 			Get(context.TODO(), configMapName, metav1.GetOptions{})
-
 		if err != nil {
-			newCM := &v1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      configMapName,
-					Namespace: namespace,
-				},
-				Data: snapshot,
-			}
-			_, err = clientset.CoreV1().ConfigMaps(namespace).
-				Create(context.TODO(), newCM, metav1.CreateOptions{})
-		} else {
-			if cm.Data == nil {
-				cm.Data = map[string]string{}
-			}
-			// Replace this node's entries wholesale so removals propagate.
-			for k, raw := range cm.Data {
-				var svc ServiceEntry
-				if json.Unmarshal([]byte(raw), &svc) == nil && svc.Origin == nodeName {
-					delete(cm.Data, k)
-				}
-			}
-			for k, v := range snapshot {
-				cm.Data[k] = v
-			}
-			_, err = clientset.CoreV1().ConfigMaps(namespace).
-				Update(context.TODO(), cm, metav1.UpdateOptions{})
+			log.Println("Failed to get ConfigMap:", err)
+			time.Sleep(time.Second)
+			continue
 		}
 
+		if cm.Data == nil {
+			cm.Data = map[string]string{}
+		}
+		// Replace this node's entries wholesale so removals propagate.
+		for k, raw := range cm.Data {
+			var svc ServiceEntry
+			if json.Unmarshal([]byte(raw), &svc) == nil && svc.Origin == nodeName {
+				delete(cm.Data, k)
+			}
+		}
+		for k, v := range snapshot {
+			cm.Data[k] = v
+		}
+
+		_, err = clientset.CoreV1().ConfigMaps(namespace).
+			Update(context.TODO(), cm, metav1.UpdateOptions{})
 		if err == nil {
 			return
 		}
