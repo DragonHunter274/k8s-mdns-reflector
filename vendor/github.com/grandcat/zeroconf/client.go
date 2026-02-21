@@ -313,21 +313,38 @@ func (c *client) shutdown() {
 	}
 }
 
+// hasInterface checks whether the given interface index matches one of the
+// interfaces this client is registered on.
+func (c *client) hasInterface(ifIndex int) bool {
+	for _, iface := range c.ifaces {
+		if iface.Index == ifIndex {
+			return true
+		}
+	}
+	return false
+}
+
 // Data receiving routine reads from connection, unpacks packets into dns.Msg
 // structures and sends them to a given msgCh channel
 func (c *client) recv(ctx context.Context, l interface{}, msgCh chan *dns.Msg) {
-	var readFrom func([]byte) (n int, src net.Addr, err error)
+	var readFrom func([]byte) (n int, ifIndex int, src net.Addr, err error)
 
 	switch pConn := l.(type) {
 	case *ipv6.PacketConn:
-		readFrom = func(b []byte) (n int, src net.Addr, err error) {
-			n, _, src, err = pConn.ReadFrom(b)
-			return
+		readFrom = func(b []byte) (n int, ifIndex int, src net.Addr, err error) {
+			n, cm, src, err := pConn.ReadFrom(b)
+			if cm != nil {
+				ifIndex = cm.IfIndex
+			}
+			return n, ifIndex, src, err
 		}
 	case *ipv4.PacketConn:
-		readFrom = func(b []byte) (n int, src net.Addr, err error) {
-			n, _, src, err = pConn.ReadFrom(b)
-			return
+		readFrom = func(b []byte) (n int, ifIndex int, src net.Addr, err error) {
+			n, cm, src, err := pConn.ReadFrom(b)
+			if cm != nil {
+				ifIndex = cm.IfIndex
+			}
+			return n, ifIndex, src, err
 		}
 
 	default:
@@ -345,9 +362,15 @@ func (c *client) recv(ctx context.Context, l interface{}, msgCh chan *dns.Msg) {
 			return
 		}
 
-		n, _, err := readFrom(buf)
+		n, ifIndex, _, err := readFrom(buf)
 		if err != nil {
 			fatalErr = err
+			continue
+		}
+		// Drop packets from interfaces we are not registered on.
+		// Without this, Linux delivers multicast packets from all interfaces
+		// to all sockets on the same port (IP_MULTICAST_ALL=1 by default).
+		if ifIndex != 0 && !c.hasInterface(ifIndex) {
 			continue
 		}
 		msg := new(dns.Msg)
