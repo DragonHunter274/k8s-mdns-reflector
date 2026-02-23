@@ -326,6 +326,7 @@ func handleClusterService(entry *zeroconf.ServiceEntry) {
 	if lbIP := lookupLoadBalancerIP(entry); lbIP != "" {
 		svc.IPs = []string{lbIP}
 	} else {
+		log.Printf("No LB IP found for %s, entry IPs: %v, falling back to nodeIP %s", entry.Instance, entry.AddrIPv4, nodeIP)
 		svc.IPs = []string{nodeIP}
 	}
 
@@ -395,6 +396,9 @@ func runServiceCacheRefresh(ctx context.Context) {
 				}
 			}
 		}
+
+		log.Printf("LB IP map: %v", newPodMap)
+		log.Printf("Ignore IPs: %v", newIgnoreIPs)
 
 		podIPToLBIPMu.Lock()
 		podIPToLBIP = newPodMap
