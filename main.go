@@ -322,13 +322,15 @@ func handleClusterService(entry *zeroconf.ServiceEntry) {
 	svc.Origin = nodeName
 	svc.Source = "cluster"
 
-	// Use the MetalLB LoadBalancer IP if the pod IP maps to one; fall back to node IP.
-	if lbIP := lookupLoadBalancerIP(entry); lbIP != "" {
-		svc.IPs = []string{lbIP}
-	} else {
-		log.Printf("No LB IP found for %s, entry IPs: %v, falling back to nodeIP %s", entry.Instance, entry.AddrIPv4, nodeIP)
-		svc.IPs = []string{nodeIP}
+	// Only reflect if the pod IP maps to a LoadBalancer IP.  Services
+	// without an LB IP either aren't exposed externally or are LAN services
+	// that leaked through to the cluster browser — either way, advertising
+	// an internal IP on the LAN is harmful.
+	lbIP := lookupLoadBalancerIP(entry)
+	if lbIP == "" {
+		return
 	}
+	svc.IPs = []string{lbIP}
 
 	storeService(svc)
 }

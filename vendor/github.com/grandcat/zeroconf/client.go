@@ -3,6 +3,7 @@ package zeroconf
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"strings"
 
@@ -362,7 +363,11 @@ func (c *client) recv(ctx context.Context, l interface{}, msgCh chan *dns.Msg) {
 		// Without this, Linux delivers multicast packets from all interfaces
 		// to all sockets on the same port (IP_MULTICAST_ALL=1 by default).
 		if ifIndex != 0 && !c.hasInterface(ifIndex) {
+			log.Printf("[zeroconf] client: dropped packet from ifIndex=%d (registered: %v)", ifIndex, c.ifaces)
 			continue
+		}
+		if ifIndex == 0 {
+			log.Printf("[zeroconf] client: WARNING received packet with ifIndex=0, cannot filter")
 		}
 		msg := new(dns.Msg)
 		if err := msg.Unpack(buf[:n]); err != nil {
