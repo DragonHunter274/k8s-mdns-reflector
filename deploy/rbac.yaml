@@ -34,7 +34,7 @@ metadata:
   name: mdns-reflector-services
 rules:
   - apiGroups: [""]
-    resources: ["services"]
+    resources: ["services", "endpoints", "nodes"]
     verbs: ["list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

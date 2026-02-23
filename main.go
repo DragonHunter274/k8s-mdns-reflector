@@ -64,10 +64,10 @@ var (
 	pendingMutex    sync.Mutex
 	pendingDirty    bool
 
-	// k8sServicesCache is a cached list of LoadBalancer services, refreshed
-	// periodically to avoid listing on every mDNS event.
-	k8sServicesCache   []v1.Service
-	k8sServicesCacheMu sync.RWMutex
+	// podIPToLBIP maps pod/endpoint IPs to their Service's LoadBalancer IP.
+	// Built from Services + Endpoints, refreshed every 30s.
+	podIPToLBIP   map[string]string
+	podIPToLBIPMu sync.RWMutex
 
 	clientset *kubernetes.Clientset
 	// ignoreIPsCache tracks Node IPs and LoadBalancer IPs to prevent proxy loops.
@@ -322,9 +322,9 @@ func handleClusterService(entry *zeroconf.ServiceEntry) {
 	svc.Origin = nodeName
 	svc.Source = "cluster"
 
-	// Use the MetalLB LoadBalancer IP if a matching Service exists; fall back to node IP.
-	if ip := lookupLoadBalancerIP(entry); ip != "" {
-		svc.IPs = []string{ip}
+	// Use the MetalLB LoadBalancer IP if the pod IP maps to one; fall back to node IP.
+	if lbIP := lookupLoadBalancerIP(entry); lbIP != "" {
+		svc.IPs = []string{lbIP}
 	} else {
 		svc.IPs = []string{nodeIP}
 	}
@@ -332,27 +332,62 @@ func handleClusterService(entry *zeroconf.ServiceEntry) {
 	storeService(svc)
 }
 
-// runServiceCacheRefresh refreshes the cached list of LoadBalancer services
-// every 30 seconds so lookupLoadBalancerIP never hits the API per-event.
+// runServiceCacheRefresh refreshes the pod-IP-to-LB-IP map and the ignore-IP
+// set every 30 seconds so lookupLoadBalancerIP never hits the API per-event.
 func runServiceCacheRefresh(ctx context.Context) {
 	refresh := func() {
-		// 1. Fetch Services (existing)
 		svcs, err := clientset.CoreV1().Services("").List(context.TODO(), metav1.ListOptions{})
 		if err != nil {
 			log.Println("Failed to refresh services cache:", err)
 			return
 		}
 
-		// 2. Fetch Nodes (NEW)
+		eps, err := clientset.CoreV1().Endpoints("").List(context.TODO(), metav1.ListOptions{})
+		if err != nil {
+			log.Println("Failed to refresh endpoints cache:", err)
+			return
+		}
+
 		nodes, err := clientset.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
 		if err != nil {
 			log.Println("Failed to refresh nodes cache:", err)
 			return
 		}
 
+		// Build Service-name-to-LB-IP index (scoped by namespace).
+		type svcKey struct{ ns, name string }
+		lbIPs := make(map[svcKey]string)
 		newIgnoreIPs := make(map[string]bool)
 
-		// Add Node IPs to the ignore list
+		for _, svc := range svcs.Items {
+			if svc.Spec.Type != v1.ServiceTypeLoadBalancer {
+				continue
+			}
+			if len(svc.Status.LoadBalancer.Ingress) == 0 {
+				continue
+			}
+			ip := svc.Status.LoadBalancer.Ingress[0].IP
+			if ip == "" {
+				continue
+			}
+			lbIPs[svcKey{svc.Namespace, svc.Name}] = ip
+			newIgnoreIPs[ip] = true
+		}
+
+		// Map every endpoint (pod) IP to its Service's LB IP.
+		newPodMap := make(map[string]string)
+		for _, ep := range eps.Items {
+			lbIP, ok := lbIPs[svcKey{ep.Namespace, ep.Name}]
+			if !ok {
+				continue
+			}
+			for _, subset := range ep.Subsets {
+				for _, addr := range subset.Addresses {
+					newPodMap[addr.IP] = lbIP
+				}
+			}
+		}
+
 		for _, node := range nodes.Items {
 			for _, addr := range node.Status.Addresses {
 				if addr.Type == v1.NodeInternalIP || addr.Type == v1.NodeExternalIP {
@@ -361,29 +396,16 @@ func runServiceCacheRefresh(ctx context.Context) {
 			}
 		}
 
-		// Add LoadBalancer IPs to the ignore list
-		for _, svc := range svcs.Items {
-			if svc.Spec.Type == v1.ServiceTypeLoadBalancer {
-				for _, ing := range svc.Status.LoadBalancer.Ingress {
-					if ing.IP != "" {
-						newIgnoreIPs[ing.IP] = true
-					}
-				}
-			}
-		}
+		podIPToLBIPMu.Lock()
+		podIPToLBIP = newPodMap
+		podIPToLBIPMu.Unlock()
 
-		// Commit Service updates
-		k8sServicesCacheMu.Lock()
-		k8sServicesCache = svcs.Items
-		k8sServicesCacheMu.Unlock()
-
-		// Commit IP Ignore list updates
 		ignoreIPsCacheMu.Lock()
 		ignoreIPsCache = newIgnoreIPs
 		ignoreIPsCacheMu.Unlock()
 	}
 
-	refresh() // populate immediately on startup
+	refresh()
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
@@ -409,32 +431,18 @@ func isProxiedIP(entry *zeroconf.ServiceEntry) bool {
 	return false
 }
 
+// lookupLoadBalancerIP checks whether any of the mDNS entry's advertised IPs
+// belong to a pod backing a LoadBalancer Service, and returns the LB IP if so.
 func lookupLoadBalancerIP(entry *zeroconf.ServiceEntry) string {
-	k8sServicesCacheMu.RLock()
-	svcs := k8sServicesCache
-	k8sServicesCacheMu.RUnlock()
+	podIPToLBIPMu.RLock()
+	m := podIPToLBIP
+	podIPToLBIPMu.RUnlock()
 
-	for _, svc := range svcs {
-		if svc.Spec.Type != v1.ServiceTypeLoadBalancer {
-			continue
-		}
-		if len(svc.Status.LoadBalancer.Ingress) == 0 {
-			continue
-		}
-		ip := svc.Status.LoadBalancer.Ingress[0].IP
-		if ip == "" {
-			continue
-		}
-		if !strings.EqualFold(svc.Name, entry.Instance) {
-			continue
-		}
-		for _, port := range svc.Spec.Ports {
-			if int(port.Port) == entry.Port {
-				return ip
-			}
+	for _, ip := range entry.AddrIPv4 {
+		if lbIP, ok := m[ip.String()]; ok {
+			return lbIP
 		}
 	}
-
 	return ""
 }
 
